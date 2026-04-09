@@ -21,7 +21,7 @@ import pydantic
 from queue import Queue
 import time
 import traceback
-from typing import Any, Dict, Optional, Set, Tuple, Union
+from typing import Any, Dict, NamedTuple, Optional, Set, Tuple, Union
 
 import als
 from log_utils import dp, error_if, get_module_logger
@@ -50,6 +50,23 @@ AVERAGING_WINDOW_SIZE = 10
 # Currently used for complete/ruleset invalidation and not for spatial one (as
 # there is, probably, no need to)
 INVALIDATION_CHUNK_SIZE = 1000
+
+# Delay in seconds before re-running an already-processed invalidation
+# request. Invalidation sweeps are UPDATE-only: a result row whose
+# computation was in flight across the sweep is INSERTed after the sweep ran
+# and escapes it (update_cache's ON CONFLICT staleness guard covers only the
+# UPDATE arm, not new-PK inserts). Re-running the sweep after the maximum
+# possible computation time (the worker's engine timeout,
+# AFC_WORKER_ENG_TOUT=300s, plus margin) invalidates such late-inserted
+# stale rows so they get recomputed against current data.
+INVALIDATION_RESWEEP_DELAY_SEC = 330
+
+
+class _ResweepReq(NamedTuple):
+    """ Second-pass wrapper around an already-processed invalidation request
+    (prevents endless rescheduling in _invalidator_worker) """
+    req: Union[RcacheInvalidateReq, RcacheSpatialInvalidateReq,
+               RcacheDirectionalInvalidateReq]
 
 
 class Ema:
@@ -157,9 +174,10 @@ class RcacheService:
         self._config_retrieval_url = config_retrieval_url.rstrip("/") \
             if config_retrieval_url else None
         self._invalidation_queue: \
-            Queue[Union[RcacheInvalidateReq, RcacheSpatialInvalidateReq]] = \
-            asyncio.Queue()
-        self._update_queue: Queue[AfcReqRespKey] = asyncio.Queue()
+            Queue[Union[RcacheInvalidateReq, RcacheSpatialInvalidateReq,
+                        RcacheDirectionalInvalidateReq, _ResweepReq]] = \
+            asyncio.Queue(maxsize=3000)
+        self._update_queue: Queue[AfcReqRespKey] = asyncio.Queue(maxsize=3000)
         self._precompute_event = asyncio.Event()
         self._precompute_event.set()
         self._precompute_quota = 0
@@ -169,6 +187,8 @@ class RcacheService:
                        self._precomputer_worker, self._averager_worker):
             self._main_tasks.add(asyncio.create_task(worker()))
         self._precomputer_subtasks: Set[asyncio.Task] = set()
+        # Pending second-pass invalidation tasks (see _resweep_later)
+        self._resweep_tasks: Set[asyncio.Task] = set()
         self._updated_count = 0
         self._precompute_count = 0
         self._updated_rate_ema = Ema(win_size=AVERAGING_WINDOW_SIZE,
@@ -258,6 +278,9 @@ class RcacheService:
         while self._precomputer_subtasks:
             task = self._precomputer_subtasks.pop()
             task.cancel()
+        while self._resweep_tasks:
+            task = self._resweep_tasks.pop()
+            task.cancel()
         await self._db.disconnect()
 
     def update(self, cache_update_req: RcacheUpdateReq) -> None:
@@ -323,12 +346,14 @@ class RcacheService:
                 while True:
                     try:
                         dr = ApDbRecord.from_req_resp_key(rrk)
-                    except pydantic.ValidationError as ex:
+                    except Exception as ex:
+                        # Catch any per-item failure (not just ValidationError)
+                        # so one malformed record cannot kill the updater task
                         LOGGER.error(
                             f"Invalid format of cache update data: {ex}")
                     else:
                         if dr is not None:
-                            row_dict = dr.dict()
+                            row_dict = dr.model_dump()
                             update_bulk[self._db.get_ap_pk(row_dict)] = \
                                 row_dict
                     if (len(update_bulk) == self._db.max_update_records()) or \
@@ -352,6 +377,11 @@ class RcacheService:
             await self._db_connected_event.wait()
             while True:
                 req = await self._invalidation_queue.get()
+                # Second pass of an already-processed request
+                # (see _resweep_later)
+                is_resweep = isinstance(req, _ResweepReq)
+                if is_resweep:
+                    req = req.req
                 while not await self.get_invalidation_enabled():
                     await asyncio.sleep(1)
                 invalid_before = await self._report_invalidation()
@@ -382,14 +412,48 @@ class RcacheService:
                                 math.radians(
                                     (rect.min_lat + rect.max_lat) / 2)),
                                 1 / 180)
-                        await self._db.spatial_invalidate(
-                            LatLonRect(
-                                min_lat=rect.min_lat - max_link_distance_deg,
-                                max_lat=rect.max_lat + max_link_distance_deg,
-                                min_lon=rect.min_lon -
-                                max_link_distance_deg / lon_reduction,
-                                max_lon=rect.max_lon +
-                                max_link_distance_deg / lon_reduction))
+                        lon_clearance = \
+                            max_link_distance_deg / lon_reduction
+                        min_lat = max(
+                            -90.0, rect.min_lat - max_link_distance_deg)
+                        max_lat = min(
+                            90.0, rect.max_lat + max_link_distance_deg)
+                        min_lon = rect.min_lon - lon_clearance
+                        max_lon = rect.max_lon + lon_clearance
+                        # The longitude clearance may cross the
+                        # antimeridian. LatLonRect hard-bounds lon to
+                        # [-180,180] so a single wrapped rectangle can't be
+                        # expressed - clamping (instead of wrapping) would
+                        # silently drop the neighbors on the other side of
+                        # +-180. Split the overflow into a second (and, for
+                        # a huge clearance, a full-globe) rectangle instead.
+                        expanded_rects = []
+                        if (max_lon - min_lon) >= 360:
+                            expanded_rects.append(
+                                LatLonRect(
+                                    min_lat=min_lat, max_lat=max_lat,
+                                    min_lon=-180.0, max_lon=180.0))
+                        else:
+                            if min_lon < -180.0:
+                                expanded_rects.append(
+                                    LatLonRect(
+                                        min_lat=min_lat, max_lat=max_lat,
+                                        min_lon=min_lon + 360.0,
+                                        max_lon=180.0))
+                                min_lon = -180.0
+                            if max_lon > 180.0:
+                                expanded_rects.append(
+                                    LatLonRect(
+                                        min_lat=min_lat, max_lat=max_lat,
+                                        min_lon=-180.0,
+                                        max_lon=max_lon - 360.0))
+                                max_lon = 180.0
+                            expanded_rects.append(
+                                LatLonRect(
+                                    min_lat=min_lat, max_lat=max_lat,
+                                    min_lon=min_lon, max_lon=max_lon))
+                        for expanded_rect in expanded_rects:
+                            await self._db.spatial_invalidate(expanded_rect)
                         invalid_before = \
                             await self._report_invalidation(
                                 f"Spatial invalidation for tile "
@@ -399,7 +463,30 @@ class RcacheService:
                 else:
                     assert isinstance(req, RcacheDirectionalInvalidateReq)
                     for beam in req.beams:
-                        await self._db.directional_invalidate(beam)
+                        try:
+                            await self._db.directional_invalidate(beam)
+                        except (Exception, SystemExit) as ex:
+                            # A single malformed/unbounded beam must not
+                            # take down the invalidator task for good -
+                            # log_utils.error() (called on DB errors) raises
+                            # SystemExit by default, so it is caught here as
+                            # well as Exception.
+                            LOGGER.error(
+                                f"Directional invalidation for beam "
+                                f"<{beam.short_str()}> failed:\n"
+                                f"{''.join(traceback.format_exception(ex))}")
+                # Invalidation only UPDATEs existing rows: a computation in
+                # flight across this sweep INSERTs its (possibly stale) row
+                # afterwards, escaping the sweep. Schedule a one-time re-run
+                # of this request after the maximum computation time, so
+                # such late-inserted stale rows are invalidated (and then
+                # recomputed) too.
+                if not is_resweep:
+                    resweep_task = \
+                        asyncio.create_task(self._resweep_later(req))
+                    self._resweep_tasks.add(resweep_task)
+                    resweep_task.add_done_callback(
+                        self._resweep_tasks.discard)
                 self._precompute_event.set()
         except asyncio.CancelledError:
             return
@@ -407,6 +494,19 @@ class RcacheService:
             self._all_tasks_running = False
             LOGGER.error(f"Invalidator task unexpectedly aborted:\n"
                          f"{''.join(traceback.format_exception(ex))}")
+
+    async def _resweep_later(
+            self,
+            req: Union[RcacheInvalidateReq, RcacheSpatialInvalidateReq,
+                       RcacheDirectionalInvalidateReq]) -> None:
+        """ Re-enqueue an already-processed invalidation request once, after
+        in-flight computations have had time to complete and write their
+        rows, wrapped in _ResweepReq so that it is not rescheduled again """
+        try:
+            await asyncio.sleep(INVALIDATION_RESWEEP_DELAY_SEC)
+            await self._invalidation_queue.put(_ResweepReq(req=req))
+        except asyncio.CancelledError:
+            return
 
     async def _report_invalidation(
             self, dsc: Optional[str] = None,
@@ -432,8 +532,10 @@ class RcacheService:
         try:
             async with aiohttp.ClientSession() as session:
                 assert self._afc_req_url is not None
-                async with session.post(self._afc_req_url,
-                                        json=json.loads(req)) as resp:
+                async with session.post(
+                        self._afc_req_url,
+                        json=json.loads(req),
+                        headers={"X-AFC-Precompute": "1"}) as resp:
                     if resp.ok:
                         return
             await self._db.delete(ApDbPk.from_req(req_str=req))
@@ -495,15 +597,19 @@ class RcacheService:
                             raise aiohttp.ClientError(
                                 "Can't receive list of active configurations")
                         rulesets = \
-                            RatapiRulesetIds.parse_obj(await resp.json())
+                            RatapiRulesetIds.model_validate(await resp.json())
                     for ruleset in rulesets.rulesetId:
                         async with session.get(
                                 f"{self._config_retrieval_url}/{ruleset}") \
                                 as resp:
                             if resp.status != http.HTTPStatus.OK.value:
+                                LOGGER.error(
+                                    f"Config retrieval for ruleset "
+                                    f"'{ruleset}' returned HTTP "
+                                    f"{resp.status}")
                                 continue
                             maxLinkDistance = \
-                                RatapiAfcConfig.parse_obj(
+                                RatapiAfcConfig.model_validate(
                                     await resp.json()).maxLinkDistance
                         if (ret is None) or (maxLinkDistance > ret):
                             ret = maxLinkDistance

@@ -1,0 +1,26 @@
+#
+# Copyright (C) 2021 Broadcom. All rights reserved. The term "Broadcom"
+# refers solely to the Broadcom Inc. corporate affiliate that owns
+# the software below. This work is licensed under the OpenAFC Project License,
+# a copy of which is included with this software program
+#
+# Hash-pinned via:
+#   docker run --rm -v "$(pwd)/objstorage/requirements.txt:/req.txt:ro"
+#     python:3.12-alpine sh -c
+#     "pip download -q --no-cache-dir --dest /p -r /req.txt 2>/dev/null &&
+#      for f in /p/*.whl /p/*.tar.gz; do [ -f \"\$f\" ] || continue;
+#        n=\$(basename \"\$f\"); h=\$(sha256sum \"\$f\" | cut -d' ' -f1);
+#        printf '%s sha256:%s\n' \"\$n\" \"\$h\"; done"
+#
+gevent==26.8.0
+
+greenlet==3.5.5
+
+gunicorn==26.2.0
+
+packaging==26.3
+
+zope.event==6.2
+
+zope.interface==8.6
+

@@ -167,6 +167,17 @@ def main(argv):
                 dst_dir = os.path.dirname(dst_path)
                 if not os.path.exists(dst_dir):
                     os.makedirs(dst_dir)
+                # Collision check keyed on the actual output path: the
+                # fullname dupe check above cannot see two different
+                # packages at the same rel_path in different inpaths, and
+                # shutil.move (os.rename semantics on POSIX) would silently
+                # replace the earlier file - an output-path collision must
+                # be an error, not a substitution.
+                if os.path.lexists(dst_path):
+                    raise ValueError(
+                        'Output collision: "{0}" already exists; '
+                        'refusing to overwrite it with "{1}"'.format(
+                            dst_path, src_path))
                 LOGGER.info('Moving %s to %s', fullname, dst_path)
                 shutil.move(src_path, dst_path)
 
